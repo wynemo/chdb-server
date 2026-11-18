@@ -15,4 +15,6 @@ run:
 
 build:
 	CGO_ENABLED=1 go build -ldflags '-extldflags "-Wl,-rpath,/usr/local/lib"' -o chdb-server main.go
-	install_name_tool -change libchdb.so /usr/local/lib/libchdb.so chdb-server
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		install_name_tool -change libchdb.so /usr/local/lib/libchdb.so chdb-server; \
+	fi

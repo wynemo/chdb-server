@@ -8,10 +8,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/chdb-io/chdb-go/chdb"
+	"github.com/chdb-io/chdb-go/chdbstable"
 )
 
 // Embedding the HTML file
@@ -28,6 +30,34 @@ func init() {
 	if path == "" {
 		path = ".chdb_data"
 	}
+}
+
+// trailingFormatRe matches a trailing "FORMAT <name>" clause (case-insensitive).
+var trailingFormatRe = regexp.MustCompile(`(?is)\s+FORMAT\s+([A-Za-z0-9_]+)\s*$`)
+
+// extractFormat splits a trailing "FORMAT xxx" clause off the query.
+// It returns the remaining query and the format name (empty if none found).
+func extractFormat(query string) (string, string) {
+	m := trailingFormatRe.FindStringSubmatchIndex(query)
+	if m == nil {
+		return query, ""
+	}
+	format := query[m[2]:m[3]]
+	return strings.TrimSpace(query[:m[0]]), format
+}
+
+// queryWithParams runs query in the session, forwarding "param_<name>" HTTP
+// parameters as chDB CLI --param_<name> arguments for {name:Type} bindings.
+func (s *server) queryWithParams(query, format string, params map[string]string) (*chdbstable.LocalResult, error) {
+	argv := []string{"clickhouse", "--multiquery", "--output-format=" + format}
+	if p := s.sess.Path(); p != "" {
+		argv = append(argv, "--path="+p)
+	}
+	for k, v := range params {
+		argv = append(argv, "--"+k+"="+v)
+	}
+	argv = append(argv, "--query="+query)
+	return chdbstable.QueryStable(len(argv), argv)
 }
 
 type server struct {
@@ -51,6 +81,13 @@ func (s *server) handleRootPost(w http.ResponseWriter, r *http.Request) {
 		format = "TSV"
 	}
 	database := r.URL.Query().Get("database")
+	// Server-side query parameters, sent by clickhouse_connect for {name:Type} placeholders.
+	params := make(map[string]string)
+	for k, vs := range r.URL.Query() {
+		if strings.HasPrefix(k, "param_") && len(vs) > 0 {
+			params[k] = vs[0]
+		}
+	}
 	var body string
 	if r.Body != nil {
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -70,13 +107,21 @@ func (s *server) handleRootPost(w http.ResponseWriter, r *http.Request) {
 	if database != "" {
 		query = "USE " + database + "; " + query
 	}
-	log.Printf("Query: %s\n", query)
-	output, err := s.sess.Query(query, format)
+	// Honor a trailing "FORMAT xxx" clause, as sent by clients like clickhouse_connect.
+	if q, f := extractFormat(query); f != "" {
+		query = q
+		format = f
+	}
+	log.Printf("Query: %s [format=%s]\n", query, format)
+	output, err := s.queryWithParams(query, format, params)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintf(w, "%s", output)
+	// Native (binary) formats must be written verbatim.
+	if _, err := w.Write(output.Buf()); err != nil {
+		log.Printf("Error writing response: %v", err)
+	}
 }
 
 func (s *server) handlePing(w http.ResponseWriter, r *http.Request) {
